@@ -1,0 +1,18 @@
+app = "expense-bot-vadim"
+
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATA_DIR = "/data"
+
+[mounts]
+  source = "ukf_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256MB"
+  count = 1

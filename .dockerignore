@@ -1,0 +1,15 @@
+.env
+*.env
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+venv/
+.venv/
+.git/
+.git/
+.fly/
+fly.toml
+README.md
+Dockerfile
+.dockerignore
