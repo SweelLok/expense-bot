@@ -4,6 +4,20 @@ from datetime import datetime, timedelta
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "expenses.db"))
 
+# Ключи таблицы settings
+SET_WARN_THRESHOLD = "warn_threshold"      # порог предупреждения по остатку категории, EUR
+SET_PLANNED_INCOME = "planned_income"      # плановый доход месяца, EUR (режим «доход месяца»)
+SET_PLAN_MODE = "plan_mode"                # от чего считать план: available | income | budget
+SET_PLAN_BUDGET = "plan_budget"            # бюджет месяца, EUR (режим «бюджет месяца»)
+
+
+async def _ensure_column(db, table: str, column: str, decl: str):
+    """Добавляет колонку, если её нет — миграция старых баз без потери данных."""
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        cols = [r[1] for r in await cur.fetchall()]
+    if column not in cols:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {decl}")
+
 
 class Database:
     def __init__(self, db_path: str = DB_PATH):
@@ -23,6 +37,7 @@ class Database:
                     user_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
                     weekly_limit REAL,
+                    monthly_limit REAL,
                     UNIQUE(user_id, name)
                 );
 
@@ -32,6 +47,8 @@ class Database:
                     name TEXT NOT NULL,
                     amount REAL NOT NULL,
                     period TEXT NOT NULL,
+                    months REAL DEFAULT 1,
+                    category_id INTEGER,
                     next_charge_date TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
@@ -48,6 +65,23 @@ class Database:
                     FOREIGN KEY (category_id) REFERENCES categories(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS incomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    currency TEXT NOT NULL DEFAULT 'EUR',
+                    description TEXT,
+                    income_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS settings (
+                    user_id INTEGER NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT,
+                    PRIMARY KEY (user_id, key)
+                );
+
                 CREATE TABLE IF NOT EXISTS message_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -57,6 +91,50 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
             """)
+
+            # Миграции баз, созданных прошлыми версиями бота
+            await _ensure_column(db, "categories", "monthly_limit", "monthly_limit REAL")
+            await _ensure_column(db, "subscriptions", "months", "months REAL DEFAULT 1")
+            await _ensure_column(db, "subscriptions", "category_id", "category_id INTEGER")
+
+            # Периодические платежи без явного периода считаем ежемесячными
+            await db.execute("UPDATE subscriptions SET months = 1 WHERE months IS NULL")
+            await db.commit()
+
+    async def reset_user(self, user_id: int):
+        """Полная очистка данных пользователя: траты, доходы, подписки, баланс, лог сообщений, настройки."""
+        async with aiosqlite.connect(self.db_path) as db:
+            for table in ("expenses", "incomes", "subscriptions", "balances", "message_log", "settings"):
+                await db.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+    # --- Settings ---
+
+    async def get_setting(self, user_id: int, key: str, default: str | None = None) -> str | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key)
+            ) as cur:
+                row = await cur.fetchone()
+                return row["value"] if row and row["value"] is not None else default
+
+    async def get_setting_float(self, user_id: int, key: str, default: float) -> float:
+        raw = await self.get_setting(user_id, key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    async def set_setting(self, user_id: int, key: str, value):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+                (user_id, key, str(value)),
+            )
             await db.commit()
 
     # --- Balances ---
@@ -106,6 +184,7 @@ class Database:
             return await self.get_category_by_name(user_id, name)
 
     async def set_category_limit(self, user_id: int, category_name: str, limit: float):
+        """Недельный лимит (старый механизм, оставлен для совместимости)."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 "UPDATE categories SET weekly_limit = ? WHERE user_id = ? AND name = ?",
@@ -113,20 +192,37 @@ class Database:
             )
             await db.commit()
 
-    # --- Subscriptions ---
+    async def set_category_monthly_plan(self, user_id: int, category_name: str, plan: float | None):
+        """Месячный план категории. plan=None — режим «авто» (делит свободный остаток)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE categories SET monthly_limit = ? WHERE user_id = ? AND name = ?",
+                (plan, user_id, category_name),
+            )
+            await db.commit()
+
+    # --- Subscriptions (периодические платежи) ---
 
     async def get_subscriptions(self, user_id: int) -> list[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY name", (user_id,)) as cur:
+            async with db.execute(
+                """SELECT s.*, c.name AS category_name FROM subscriptions s
+                   LEFT JOIN categories c ON s.category_id = c.id
+                   WHERE s.user_id = ? ORDER BY s.amount DESC, s.name""",
+                (user_id,),
+            ) as cur:
                 rows = await cur.fetchall()
                 return [dict(r) for r in rows]
 
-    async def add_subscription(self, user_id: int, name: str, amount: float, period: str, next_charge: str):
+    async def add_subscription(self, user_id: int, name: str, amount: float, period: str,
+                               next_charge: str | None = None, months: float = 1.0,
+                               category_id: int | None = None):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO subscriptions (user_id, name, amount, period, next_charge_date) VALUES (?, ?, ?, ?, ?)",
-                (user_id, name, amount, period, next_charge),
+                "INSERT INTO subscriptions (user_id, name, amount, period, months, category_id, next_charge_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, name, amount, period, months, category_id, next_charge),
             )
             await db.commit()
 
@@ -136,13 +232,107 @@ class Database:
             await db.commit()
             return cursor.rowcount > 0
 
+    async def update_subscription(self, user_id: int, sub_id: int, **fields):
+        """Меняет поля платежа (name, amount, period, months, category_id)."""
+        if not fields:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values()) + [user_id, sub_id]
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(f"UPDATE subscriptions SET {set_clause} WHERE user_id = ? AND id = ?", values)
+            await db.commit()
+
+    async def get_subscription(self, user_id: int, sub_id: int) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT s.*, c.name AS category_name FROM subscriptions s
+                   LEFT JOIN categories c ON s.category_id = c.id
+                   WHERE s.user_id = ? AND s.id = ?""",
+                (user_id, sub_id),
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    # --- Incomes ---
+
+    async def add_income(self, user_id: int, amount: float, currency: str, description: str | None,
+                         income_date: str) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "INSERT INTO incomes (user_id, amount, currency, description, income_date, created_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
+                (user_id, amount, currency, description, income_date),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_last_income(self, user_id: int) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM incomes WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def get_incomes(self, user_id: int, start_date: str | None = None, end_date: str | None = None,
+                          limit: int = 20, offset: int = 0) -> list[dict]:
+        query = "SELECT * FROM incomes WHERE user_id = ?"
+        params: list = [user_id]
+        if start_date:
+            query += " AND income_date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND income_date <= ?"
+            params.append(end_date)
+        query += " ORDER BY income_date DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    async def get_income_total(self, user_id: int, start_date: str | None = None,
+                               end_date: str | None = None) -> float:
+        query = "SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE user_id = ?"
+        params: list = [user_id]
+        if start_date:
+            query += " AND income_date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND income_date <= ?"
+            params.append(end_date)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cur:
+                row = await cur.fetchone()
+                return float(row["total"]) if row else 0.0
+
+    async def get_income_by_id(self, user_id: int, income_id: int) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM incomes WHERE user_id = ? AND id = ?", (user_id, income_id)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def delete_income(self, user_id: int, income_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("DELETE FROM incomes WHERE user_id = ? AND id = ?", (user_id, income_id))
+            await db.commit()
+            return cursor.rowcount > 0
+
     # --- Expenses ---
 
     async def add_expense(self, user_id: int, amount: float, currency: str, category_id: int,
                            description: str | None, expense_date: str) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                "INSERT INTO expenses (user_id, amount, currency, category_id, description, expense_date) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO expenses (user_id, amount, currency, category_id, description, expense_date, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, datetime('now','localtime'))",
                 (user_id, amount, currency, category_id, description, expense_date),
             )
             await db.commit()
@@ -226,6 +416,23 @@ class Database:
                 row = await cur.fetchone()
                 return row["cnt"] if row else 0
 
+    async def get_spending_by_category(self, user_id: int, start_date: str, end_date: str) -> list[dict]:
+        """Сумма трат по категориям за произвольный период."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT c.id AS category_id, c.name AS category_name,
+                          COALESCE(SUM(e.amount), 0) AS spent
+                   FROM categories c
+                   LEFT JOIN expenses e ON e.category_id = c.id
+                        AND e.expense_date >= ? AND e.expense_date <= ?
+                   WHERE c.user_id = ?
+                   GROUP BY c.id ORDER BY c.name""",
+                (start_date, end_date, user_id),
+            ) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
     async def get_weekly_spending_by_category(self, user_id: int) -> list[dict]:
         week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         async with aiosqlite.connect(self.db_path) as db:
@@ -261,10 +468,27 @@ class Database:
     async def log_message(self, user_id: int, chat_id: int, message_id: int, is_bot: int = 0):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO message_log (user_id, chat_id, message_id, is_bot) VALUES (?, ?, ?, ?)",
+                "INSERT INTO message_log (user_id, chat_id, message_id, is_bot, created_at) "
+                "VALUES (?, ?, ?, ?, datetime('now','localtime'))",
                 (user_id, chat_id, message_id, is_bot),
             )
             await db.commit()
+
+    # --- Отчёты по дням ---
+
+    async def get_daily_spending(self, user_id: int, start_date: str, end_date: str) -> list[dict]:
+        """Сумма трат по каждому дню периода: [{day, spent, cnt}, ...]."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT expense_date AS day, COALESCE(SUM(amount), 0) AS spent, COUNT(*) AS cnt
+                   FROM expenses
+                   WHERE user_id = ? AND expense_date >= ? AND expense_date <= ?
+                   GROUP BY expense_date ORDER BY expense_date""",
+                (user_id, start_date, end_date),
+            ) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
 
     async def get_message_ids(self, user_id: int, chat_id: int) -> list[int]:
         async with aiosqlite.connect(self.db_path) as db:

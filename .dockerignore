@@ -7,9 +7,11 @@ __pycache__/
 venv/
 .venv/
 .git/
-.git/
 .fly/
 fly.toml
 README.md
+DEPLOY-FLY.md
 Dockerfile
 .dockerignore
+build/
+backups/
