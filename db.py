@@ -183,6 +183,22 @@ class Database:
             await db.commit()
             return await self.get_category_by_name(user_id, name)
 
+    async def rename_category(self, user_id: int, category_id: int, name: str):
+        """Переименование категории: траты ссылаются по id, поэтому история не рвётся."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE categories SET name = ? WHERE user_id = ? AND id = ?", (name, user_id, category_id)
+            )
+            await db.commit()
+
+    async def delete_category(self, user_id: int, category_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM categories WHERE user_id = ? AND id = ?", (user_id, category_id)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def set_category_limit(self, user_id: int, category_name: str, limit: float):
         """Недельный лимит (старый механизм, оставлен для совместимости)."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -401,7 +417,8 @@ class Database:
                 return [dict(r) for r in rows]
 
     async def get_expenses_count(self, user_id: int, start_date: str | None = None,
-                                  end_date: str | None = None) -> int:
+                                  end_date: str | None = None,
+                                  category_id: int | None = None) -> int:
         query = "SELECT COUNT(*) as cnt FROM expenses WHERE user_id = ?"
         params: list = [user_id]
         if start_date:
@@ -410,6 +427,9 @@ class Database:
         if end_date:
             query += " AND expense_date <= ?"
             params.append(end_date)
+        if category_id:
+            query += " AND category_id = ?"
+            params.append(category_id)
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, params) as cur:
@@ -489,6 +509,47 @@ class Database:
             ) as cur:
                 rows = await cur.fetchall()
                 return [dict(r) for r in rows]
+
+    # --- Отчёты по месяцам ---
+
+    async def get_monthly_totals(self, user_id: int, start_date: str) -> list[dict]:
+        """Траты и доходы по месяцам: [{month: '2026-10', spent, cnt, income}, ...].
+
+        start_date — граница окна (YYYY-MM-DD, включительно). Возвращаются только месяцы,
+        в которых что-то было; пропуски достраивает вызывающая сторона, чтобы график
+        не «схлопывал» пустые месяцы.
+        """
+        totals: dict[str, dict] = {}
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT substr(expense_date, 1, 7) AS month,
+                          COALESCE(SUM(amount), 0) AS spent, COUNT(*) AS cnt
+                   FROM expenses
+                   WHERE user_id = ? AND expense_date >= ?
+                   GROUP BY month ORDER BY month""",
+                (user_id, start_date),
+            ) as cur:
+                for row in await cur.fetchall():
+                    totals[row["month"]] = {
+                        "month": row["month"], "spent": float(row["spent"]),
+                        "cnt": int(row["cnt"]), "income": 0.0,
+                    }
+            async with db.execute(
+                """SELECT substr(income_date, 1, 7) AS month,
+                          COALESCE(SUM(amount), 0) AS income
+                   FROM incomes
+                   WHERE user_id = ? AND income_date >= ?
+                   GROUP BY month ORDER BY month""",
+                (user_id, start_date),
+            ) as cur:
+                for row in await cur.fetchall():
+                    item = totals.setdefault(
+                        row["month"],
+                        {"month": row["month"], "spent": 0.0, "cnt": 0, "income": 0.0},
+                    )
+                    item["income"] = float(row["income"])
+        return [totals[key] for key in sorted(totals)]
 
     async def get_message_ids(self, user_id: int, chat_id: int) -> list[int]:
         async with aiosqlite.connect(self.db_path) as db:

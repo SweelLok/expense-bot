@@ -22,3 +22,12 @@ venv/
 
 # Fly.io
 .fly/
+
+# Веб-версия: исходники бота на GitHub остаются как были
+.webtest/
+.venv-web/
+.venv-web-req.txt
+frontend/node_modules/
+frontend/dist/
+web/static/
+ГДЕ-ЧТО-ЛЕЖИТ.md
